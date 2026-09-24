@@ -7,3 +7,9 @@ venv/
 
 # ML-KEM private keys created by the cloud service (CLOUD_KEM_KEY_FILE)
 .keys/
+
+# Screenshots and other images saved in the project root are personal
+# working files, not part of the repository.
+/*.png
+/*.jpg
+/*.jpeg
