@@ -1,0 +1,4 @@
+# Pinned exactly: this is the cryptographic core, and a silent upgrade of it
+# should be a reviewed change, not something pip decides.
+kyber-py==1.2.0
+cryptography>=42.0

@@ -123,6 +123,88 @@ def measure_key_establishment() -> dict:
     }
 
 
+# Fewer iterations for ML-KEM: kyber-py is pure Python and each operation
+# takes milliseconds rather than microseconds.
+MLKEM_ITERATIONS = 200
+
+
+def measure_mlkem() -> dict:
+    """The implemented ML-KEM channel's real cost, measured with kyber-py.
+
+    Reports raw handshake bytes (the cryptographic payload) and the bytes of
+    the actual JSON bodies (base64 inflates them by a third), plus the time
+    of each ML-KEM operation and of sealing one reading. The "projected"
+    figure above assumed a single encapsulation; the implemented handshake
+    uses two (long-term key for authentication, one-time key for forward
+    secrecy), so it is roughly twice the size.
+    """
+    from pqc_channel import channel
+
+    cloud_pk, cloud_sk = channel.generate_keypair()
+    static_ss, static_ct = channel.encapsulate(cloud_pk)
+    eph_pk, eph_sk = channel.generate_keypair()
+    eph_ss, eph_ct = channel.encapsulate(eph_pk)
+    proof = channel.gateway_proof("token", static_ct, eph_pk)
+    aead_key, confirm_key = channel.derive_session_keys(
+        static_ss, eph_ss,
+        channel.transcript(cloud_pk, static_ct, eph_pk, eph_ct))
+    session_id = channel.new_session_id()
+    tag = channel.confirmation_tag(confirm_key, session_id)
+
+    # The same JSON bodies the gateway and cloud exchange.
+    bodies = [
+        {"algorithm": channel.ALGORITHM,
+         "public_key": channel.b64encode(cloud_pk),
+         "fingerprint": channel.fingerprint(cloud_pk)},
+        {"static_ciphertext": channel.b64encode(static_ct),
+         "ephemeral_public_key": channel.b64encode(eph_pk),
+         "gateway_proof": channel.b64encode(proof)},
+        {"session_id": session_id,
+         "ephemeral_ciphertext": channel.b64encode(eph_ct),
+         "confirmation": channel.b64encode(tag),
+         "expires_in_s": 3600, "max_messages": 10000},
+    ]
+    raw_bytes = (len(cloud_pk) + len(static_ct) + len(eph_pk) + len(proof)
+                 + len(eph_ct) + len(tag))
+
+    reading = json.dumps(parse_reading_dict(REFERENCE_RECORD),
+                         separators=(",", ":")).encode()
+    nonce, sealed = channel.seal(aead_key, 0, session_id, reading)
+    sealed_body = {"session_id": session_id,
+                   "nonce": channel.b64encode(nonce),
+                   "ciphertext": channel.b64encode(sealed)}
+
+    return {
+        "mechanism": "ML-KEM-768 x2 (long-term + ephemeral) -> HKDF-SHA256 "
+                     "-> AES-256-GCM",
+        "library": "kyber-py (pure Python, not constant-time)",
+        "handshake_round_trips": 2,
+        "handshake_round_trips_note": "1 to fetch the public key (cacheable) "
+                                      "+ 1 for the key exchange",
+        "handshake_raw_bytes": raw_bytes,
+        "handshake_json_bytes": sum(len(json.dumps(b)) for b in bodies),
+        "legacy_reading_json_bytes": len(reading),
+        "sealed_reading_json_bytes": len(json.dumps(sealed_body)),
+        "keygen": _time_calls(channel.generate_keypair, MLKEM_ITERATIONS),
+        "encaps": _time_calls(lambda: channel.encapsulate(cloud_pk),
+                              MLKEM_ITERATIONS),
+        "decaps": _time_calls(lambda: channel.decapsulate(cloud_sk,
+                                                          static_ct),
+                              MLKEM_ITERATIONS),
+        "seal_reading": _time_calls(
+            lambda: channel.seal(aead_key, 1, session_id, reading),
+            CRYPTO_ITERATIONS),
+        "key_rotation_supported": True,
+        "forward_secrecy": True,
+    }
+
+
+def parse_reading_dict(record: str) -> dict:
+    """The reading as the gateway forwards it to the cloud."""
+    from legacy_device.protocol import parse_reading
+    return parse_reading(record)
+
+
 def _time_calls(fn, iterations: int) -> dict:
     """Run fn() `iterations` times and summarise the per-call duration."""
     samples = []
@@ -278,7 +360,7 @@ def print_report(results: dict) -> None:
         print(f"  {label:<34} {value}")
 
     print("\n" + "=" * 68)
-    print("  BASELINE MEASUREMENTS - legacy system, before ML-KEM")
+    print(f"  MEASUREMENTS - {results['label']}")
     print("=" * 68)
 
     sizes = results["frame_sizes"]
@@ -309,6 +391,17 @@ def print_report(results: dict) -> None:
                   f"p95 {stats['p95_ms']} ms, "
                   f"{stats['ops_per_second']:,} ops/s")
 
+    if "mlkem" in results:
+        mk = results["mlkem"]
+        print("\nML-KEM channel (implemented)")
+        row("mechanism", mk["mechanism"])
+        row("handshake", f"{mk['handshake_raw_bytes']} B raw, "
+                         f"{mk['handshake_json_bytes']} B as JSON")
+        row("reading on the wire", f"{mk['legacy_reading_json_bytes']} B plain -> "
+                                   f"{mk['sealed_reading_json_bytes']} B sealed")
+        for name in ("keygen", "encaps", "decaps", "seal_reading"):
+            row(name, f"median {mk[name]['median_ms']} ms")
+
     if "end_to_end" in results:
         e2e = results["end_to_end"]
         print("\nEnd-to-end latency (device -> cloud)")
@@ -332,7 +425,7 @@ def print_report(results: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Measure the legacy system before ML-KEM integration"
+        description="Measure the system (run before and after ML-KEM integration)"
     )
     parser.add_argument("--e2e", action="store_true",
                         help="also measure end-to-end latency and throughput "
@@ -361,6 +454,13 @@ def main() -> int:
         "key_establishment": measure_key_establishment(),
         "crypto_throughput": measure_crypto_throughput(),
     }
+
+    # Only once ML-KEM is integrated. Skipped cleanly if kyber-py is missing,
+    # so the script can still reproduce a pure baseline run.
+    try:
+        results["mlkem"] = measure_mlkem()
+    except ImportError as exc:
+        print(f"! ML-KEM not measured: {exc}", file=sys.stderr)
 
     if args.e2e:
         if not _cloud_reachable(cloud_url):

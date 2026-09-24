@@ -1,3 +1,4 @@
 -r legacy_device/requirements.txt
 -r edge_gateway/requirements.txt
 -r cloud_service/requirements.txt
+-r pqc_channel/requirements.txt

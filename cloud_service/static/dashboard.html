@@ -1,0 +1,371 @@
+<!doctype html>
+<!--
+  Live dashboard for the cloud service, served at "/".
+
+  Plain HTML and JavaScript with no external files, so it works offline during
+  a demo. It only reads the service's public JSON endpoints (/health,
+  /api/v1/devices, /api/v1/telemetry) every few seconds; it has no endpoint or
+  privileges of its own.
+
+  Colours match docs/brief.html: teal = post-quantum, amber = legacy.
+
+  Security note: device_id and other values come from whoever posted the
+  reading, so they are untrusted. Every value is written with textContent,
+  never innerHTML, so a device named "<script>..." is shown as text rather
+  than run.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PQC Telemetry Dashboard</title>
+<style>
+  :root {
+    --ground:#f2f5f8; --surface:#ffffff; --surface-2:#e8eef4;
+    --ink:#141d29; --ink-2:#4a5a6d; --ink-3:#78889b;
+    --line:#d3dce5;
+    --pq:#0d6b86; --pq-soft:#ddeef4;
+    --legacy:#96580f; --legacy-soft:#f6ecdb;
+    --crit:#a5302a; --crit-soft:#f7e1df; --ok:#2b6f46;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground:#0f141b; --surface:#161d26; --surface-2:#1d2732;
+      --ink:#e7ecf2; --ink-2:#a4b2c3; --ink-3:#77869a;
+      --line:#26313e;
+      --pq:#57c5e0; --pq-soft:#102e39;
+      --legacy:#dba660; --legacy-soft:#2e2517;
+      --crit:#f09088; --crit-soft:#3a1d1b; --ok:#77c896;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font: 15px/1.45 var(--sans);
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 24px 16px 48px; }
+
+  header {
+    display: flex; flex-wrap: wrap; align-items: baseline;
+    justify-content: space-between; gap: 8px 24px; margin-bottom: 20px;
+  }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  h1 span { color: var(--ink-3); font-weight: 400; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--ink-2); margin: 0 0 12px;
+  }
+  .live { color: var(--ink-2); font-size: 13px; display: flex; gap: 8px; align-items: center; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  .dot.down { background: var(--crit); }
+
+  .banner {
+    display: none; margin-bottom: 16px; padding: 10px 14px; border-radius: 8px;
+    background: var(--crit-soft); color: var(--crit); font-weight: 600;
+  }
+  .banner.show { display: block; }
+
+  .tiles {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px; margin-bottom: 16px;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px;
+    /* Grid items default to min-width:auto, which lets a wide table stretch
+       the whole page past a phone screen. 0 keeps the card inside its column
+       and lets .table-wrap scroll instead. */
+    min-width: 0;
+  }
+  .tile .label { color: var(--ink-2); font-size: 13px; }
+  .tile .value {
+    font-size: 28px; font-weight: 650; margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .tile .sub { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
+
+  .share-bar {
+    height: 6px; border-radius: 3px; margin-top: 10px; overflow: hidden;
+    background: var(--legacy-soft); display: flex;
+  }
+  .share-bar i { display: block; background: var(--pq); }
+
+  .grid { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 900px) { .grid { grid-template-columns: 5fr 7fr; } }
+
+  dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 10px 16px; }
+  dt { color: var(--ink-2); font-size: 13px; }
+  dd { margin: 0; min-width: 0; }
+  .fp {
+    font-family: var(--mono); font-size: 12px; word-break: break-all;
+    background: var(--surface-2); padding: 6px 8px; border-radius: 6px;
+  }
+  button {
+    font: inherit; font-size: 12px; margin-top: 6px; padding: 4px 10px;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: var(--surface); color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--pq); }
+
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; white-space: nowrap;
+  }
+  .badge.pq { background: var(--pq-soft); color: var(--pq); }
+  .badge.legacy { background: var(--legacy-soft); color: var(--legacy); }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th {
+    text-align: left; font-weight: 600; font-size: 12px; color: var(--ink-2);
+    padding: 0 10px 8px 0; border-bottom: 1px solid var(--line); white-space: nowrap;
+  }
+  td { padding: 8px 10px 8px 0; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; }
+  .muted { color: var(--ink-3); }
+  .empty { color: var(--ink-3); padding: 12px 0; }
+  .stack { display: grid; gap: 16px; min-width: 0; }
+  footer { color: var(--ink-3); font-size: 12px; margin-top: 20px; }
+  code { font-family: var(--mono); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Telemetry <span>· edge–cloud PQC migration</span></h1>
+    <div class="live"><span class="dot" id="dot"></span><span id="updated">connecting…</span></div>
+  </header>
+
+  <div class="banner" id="banner">Cloud service unreachable - retrying.</div>
+
+  <section class="tiles">
+    <div class="card tile">
+      <div class="label">Stored readings</div>
+      <div class="value" id="t-stored">–</div>
+      <div class="sub">in memory, newest 1000 kept</div>
+    </div>
+    <div class="card tile">
+      <div class="label">Devices</div>
+      <div class="value" id="t-devices">–</div>
+      <div class="sub">seen since start-up</div>
+    </div>
+    <div class="card tile">
+      <div class="label">Delivered over ML-KEM</div>
+      <div class="value" id="t-share">–</div>
+      <div class="sub" id="t-share-sub">&nbsp;</div>
+      <div class="share-bar"><i id="t-share-bar" style="width:0%"></i></div>
+    </div>
+    <div class="card tile">
+      <div class="label">Active ML-KEM sessions</div>
+      <div class="value" id="t-sessions">–</div>
+      <div class="sub">one per connected gateway</div>
+    </div>
+  </section>
+
+  <div class="grid">
+    <div class="stack">
+      <section class="card">
+        <h2>Post-quantum channel</h2>
+        <dl>
+          <dt>Algorithm</dt>
+          <dd id="p-alg">–</dd>
+          <dt>Session cipher</dt>
+          <dd>AES-256-GCM</dd>
+          <dt>Legacy ingest</dt>
+          <dd id="p-legacy">–</dd>
+          <dt>Key fingerprint</dt>
+          <dd>
+            <div class="fp" id="p-fp">–</div>
+            <button type="button" id="copy">Copy for --cloud-key-fingerprint</button>
+          </dd>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h2>Devices</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Device</th><th class="num">Temp °C</th><th class="num">RH %</th>
+              <th class="num">Readings</th><th>Last seen</th>
+            </tr></thead>
+            <tbody id="devices"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="devices-empty">No devices yet. Start one with
+          <code>python -m legacy_device.device</code></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>Latest readings</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Received</th><th>Device</th><th class="num">Seq</th>
+            <th class="num">Temp °C</th><th class="num">RH %</th><th>Channel</th>
+          </tr></thead>
+          <tbody id="readings"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="readings-empty">Waiting for the first reading…</div>
+    </section>
+  </div>
+
+  <footer>Refreshes every 2 seconds from <code>/health</code>,
+    <code>/api/v1/devices</code> and <code>/api/v1/telemetry</code>.
+    API console: <a href="/docs">/docs</a></footer>
+</div>
+
+<script>
+"use strict";
+
+const REFRESH_MS = 2000;
+const $ = (id) => document.getElementById(id);
+
+// Build a table cell with text content only (see the security note at the top).
+function cell(text, className) {
+  const td = document.createElement("td");
+  td.textContent = text;
+  if (className) td.className = className;
+  return td;
+}
+
+function channelBadge(channel) {
+  const td = document.createElement("td");
+  const span = document.createElement("span");
+  const pq = channel === "mlkem";
+  span.className = "badge " + (pq ? "pq" : "legacy");
+  span.textContent = pq ? "ML-KEM" : "legacy";
+  td.appendChild(span);
+  return td;
+}
+
+function ago(iso) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso)) / 1000));
+  if (s < 60) return s + " s ago";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  return Math.round(s / 3600) + " h ago";
+}
+
+function clock(iso) {
+  return new Date(iso).toLocaleTimeString([], { hour12: false });
+}
+
+async function getJson(path) {
+  const response = await fetch(path, { cache: "no-store" });
+  if (!response.ok) throw new Error(path + " returned " + response.status);
+  return response.json();
+}
+
+function renderHealth(h) {
+  const pqc = h.pqc || {};
+  const byChannel = pqc.readings_by_channel || {};
+  const total = (byChannel.mlkem || 0) + (byChannel.legacy || 0);
+  const share = total ? Math.round(100 * (byChannel.mlkem || 0) / total) : 0;
+
+  $("t-stored").textContent = h.stored_readings;
+  $("t-sessions").textContent = pqc.active_sessions ?? "–";
+  $("t-share").textContent = total ? share + "%" : "–";
+  $("t-share-sub").textContent = total
+    ? (byChannel.mlkem || 0) + " ML-KEM · " + (byChannel.legacy || 0) + " legacy"
+    : "no readings yet";
+  $("t-share-bar").style.width = share + "%";
+
+  $("p-alg").textContent = pqc.algorithm || "–";
+  $("p-fp").textContent = pqc.public_key_fingerprint || "–";
+
+  const legacy = $("p-legacy");
+  legacy.textContent = "";
+  const badge = document.createElement("span");
+  badge.className = "badge " + (pqc.legacy_ingest_enabled ? "legacy" : "pq");
+  badge.textContent = pqc.legacy_ingest_enabled
+    ? "enabled (migration in progress)"
+    : "disabled (ML-KEM only)";
+  legacy.appendChild(badge);
+}
+
+function renderDevices(d) {
+  $("t-devices").textContent = d.count;
+  const body = $("devices");
+  body.textContent = "";
+  for (const dev of d.devices) {
+    const tr = document.createElement("tr");
+    tr.append(
+      cell(dev.device_id),
+      cell(dev.last_temp_c.toFixed(2), "num"),
+      cell(dev.last_humidity.toFixed(2), "num"),
+      cell(dev.readings, "num"),
+      cell(ago(dev.last_seen), "muted"),
+    );
+    body.appendChild(tr);
+  }
+  $("devices-empty").style.display = d.count ? "none" : "block";
+}
+
+function renderReadings(t) {
+  const body = $("readings");
+  body.textContent = "";
+  for (const r of t.readings) {
+    const tr = document.createElement("tr");
+    tr.append(
+      cell(clock(r.received_at), "muted"),
+      cell(r.device_id),
+      cell(r.seq, "num"),
+      cell(r.temp_c.toFixed(2), "num"),
+      cell(r.humidity.toFixed(2), "num"),
+      channelBadge(r.channel),
+    );
+    body.appendChild(tr);
+  }
+  $("readings-empty").style.display = t.count ? "none" : "block";
+}
+
+async function refresh() {
+  try {
+    const [health, devices, telemetry] = await Promise.all([
+      getJson("/health"),
+      getJson("/api/v1/devices"),
+      getJson("/api/v1/telemetry?limit=15"),
+    ]);
+    renderHealth(health);
+    renderDevices(devices);
+    renderReadings(telemetry);
+    $("banner").classList.remove("show");
+    $("dot").classList.remove("down");
+    $("updated").textContent = "live · updated " + clock(new Date().toISOString());
+  } catch (err) {
+    $("banner").classList.add("show");
+    $("dot").classList.add("down");
+    $("updated").textContent = "offline";
+  } finally {
+    setTimeout(refresh, REFRESH_MS);
+  }
+}
+
+$("copy").addEventListener("click", async () => {
+  const button = $("copy");
+  try {
+    await navigator.clipboard.writeText($("p-fp").textContent);
+    button.textContent = "Copied";
+  } catch (err) {
+    // Clipboard access can be refused by the browser; selecting the text
+    // still lets the user copy it by hand.
+    const range = document.createRange();
+    range.selectNodeContents($("p-fp"));
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    button.textContent = "Selected - press Ctrl+C";
+  }
+  setTimeout(() => { button.textContent = "Copy for --cloud-key-fingerprint"; }, 2000);
+});
+
+refresh();
+</script>
+</body>
+</html>

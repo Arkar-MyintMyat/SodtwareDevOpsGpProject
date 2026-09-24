@@ -236,3 +236,36 @@ def test_storage_is_bounded(client):
     finally:
         with cloud._lock:
             cloud._readings = collections.deque(maxlen=original)
+
+
+# --------------------------------------------------------------------------
+# Dashboard
+# --------------------------------------------------------------------------
+
+def test_dashboard_is_served_at_the_root(client):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "PQC Telemetry Dashboard" in response.text
+
+
+def test_dashboard_never_uses_innerhtml(client):
+    """Device ids are attacker-controlled; the page must write them as text.
+
+    A reading posted with device_id "<img src=x onerror=...>" would run as
+    script if the dashboard inserted it with innerHTML.
+    """
+    page = client.get("/").text
+    for sink in (".innerHTML", ".outerHTML", "insertAdjacentHTML",
+                 "document.write"):
+        assert sink not in page, f"dashboard uses {sink}"
+
+
+def test_health_counts_readings_per_channel(client):
+    client.post("/api/v1/telemetry", json=reading(1), headers=AUTH)
+    client.post("/api/v1/telemetry", json=reading(2), headers=AUTH)
+
+    counts = client.get("/health").json()["pqc"]["readings_by_channel"]
+
+    assert counts == {"mlkem": 0, "legacy": 2}

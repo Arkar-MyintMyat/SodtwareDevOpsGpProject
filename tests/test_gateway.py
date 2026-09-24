@@ -74,6 +74,8 @@ def test_stats_snapshot_is_consistent():
         "forwarded_ok": 1,
         "forward_failed": 0,
         "replays_dropped": 0,
+        "handshakes_ok": 0,
+        "handshakes_failed": 0,
     }
 
 
@@ -138,7 +140,12 @@ class CloudStub:
 
 @pytest.fixture
 def running_gateway(monkeypatch):
-    """Start a GatewayServer on a free port with a stubbed cloud.
+    """Start a GatewayServer on the legacy path with a stubbed cloud.
+
+    These tests exercise the device-facing side (framing, replay, threading),
+    which is the same whichever uplink is configured; the legacy uplink is
+    used because its single POST is the simplest thing to stub. The ML-KEM
+    uplink is tested against the real cloud in tests/test_pqc_integration.py.
 
     Yields (server, cloud_stub, port). The server is shut down afterwards so
     tests do not leak threads or sockets.
@@ -148,7 +155,8 @@ def running_gateway(monkeypatch):
 
     # Port 0 asks the OS for any free port, so tests never collide with a
     # gateway the developer is running by hand on 9000.
-    server = gw.GatewayServer(("127.0.0.1", 0), "http://cloud.test")
+    server = gw.GatewayServer(("127.0.0.1", 0),
+                              gw.LegacyUplink("http://cloud.test"))
     port = server.server_address[1]
 
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -275,7 +283,8 @@ def test_cloud_failure_is_counted_and_the_reading_is_lost(monkeypatch):
     cloud = CloudStub(fail_with=requests.ConnectionError("cloud is down"))
     monkeypatch.setattr(gw.requests, "post", cloud.post)
 
-    server = gw.GatewayServer(("127.0.0.1", 0), "http://cloud.test")
+    server = gw.GatewayServer(("127.0.0.1", 0),
+                              gw.LegacyUplink("http://cloud.test"))
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

@@ -24,24 +24,49 @@ WHY IT MATTERS FOR THIS PROJECT
     becomes quantum-safe, while the short local hop stays legacy and is
     documented as accepted residual risk.
 
+HOW IT TALKS TO THE CLOUD (--crypto)
+    mlkem   (default) PqcUplink: ML-KEM-768 handshake, then every reading is
+            sealed with AES-256-GCM. See pqc_channel/channel.py.
+    legacy  LegacyUplink: the original plain JSON + static token path, kept
+            only so an operator can roll back during the migration.
+
+    FALLBACK POLICY: the gateway never switches from mlkem to legacy on its
+    own. If the handshake fails, readings are counted as failed and dropped,
+    exactly as when the cloud is down. An automatic fallback would let any
+    attacker who can block the handshake force traffic back onto the weak
+    path (a downgrade attack), which would defeat the migration. Falling back
+    is a deliberate operator decision: restart with --crypto legacy.
+
 WHAT IS STILL MISSING (known technical debt, tracked in README.md)
     * No store-and-forward queue: readings are lost when the cloud is down.
-    * No TLS to the cloud, and a static shared token instead of real identity.
+    * No TLS to the cloud. The v2 channel protects reading payloads itself,
+      but the gateway's identity is still one static shared token (proved,
+      not sent, on the v2 path).
+    * Without --cloud-key-fingerprint the gateway trusts whichever cloud key
+      it sees first (trust on first use), which a man in the middle present
+      at that moment could exploit. Always pin in a real deployment.
     * Replay state is in memory only, so a restart forgets every sequence
       number and briefly drops traffic from devices that keep counting.
     * No /health or /metrics endpoint of its own yet - stats are only logged.
 
 Run:
     python -m edge_gateway.gateway --cloud-url http://127.0.0.1:8000
+    python -m edge_gateway.gateway --cloud-key-fingerprint <hex from cloud /health>
 """
 
 import argparse
+import hmac
+import json
 import logging
+import os
 import socketserver
 import threading
+import time
 from dataclasses import dataclass, field
 
 import requests
+
+from pqc_channel import channel
 
 # Imported rather than duplicated so there is exactly one definition of the
 # wire format. It does couple two separately deployable services, which is
@@ -51,11 +76,15 @@ from legacy_device.protocol import decrypt_frame, parse_reading
 
 log = logging.getLogger("edge-gateway")
 
-# Static bearer token shared with the cloud service. More legacy debt: one
-# string for every gateway, no rotation, no per-gateway identity. Anyone who
-# learns it can inject telemetry, which is demonstrable by hand through the
-# cloud's own /docs page. ML-KEM-derived session keys are what replace it.
-GATEWAY_TOKEN = "legacy-gateway-token"
+# Static token shared with the cloud service. More legacy debt: one string for
+# every gateway, no rotation, no per-gateway identity. On the legacy path it is
+# sent in clear in an X-Gateway-Token header, so anyone who sees one request
+# can inject telemetry. On the ML-KEM path it only feeds an HMAC inside the
+# handshake and never leaves the gateway.
+#
+# Read from the environment so a deployment can set it without editing code,
+# matching the cloud service.
+GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "legacy-gateway-token")
 
 # Give up on a cloud request rather than holding a device thread open forever.
 CLOUD_TIMEOUT_S = 5.0
@@ -84,6 +113,10 @@ class GatewayStats:
     forwarded_ok: int = 0
     forward_failed: int = 0
     replays_dropped: int = 0
+    # Post-quantum observability: a rising failure count is how an operator
+    # would notice a pinning mismatch or a cloud key rotation gone wrong.
+    handshakes_ok: int = 0
+    handshakes_failed: int = 0
 
     # repr=False keeps the lock out of log lines when the dataclass is printed.
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -106,6 +139,8 @@ class GatewayStats:
                 "forwarded_ok": self.forwarded_ok,
                 "forward_failed": self.forward_failed,
                 "replays_dropped": self.replays_dropped,
+                "handshakes_ok": self.handshakes_ok,
+                "handshakes_failed": self.handshakes_failed,
             }
 
 
@@ -144,6 +179,247 @@ class SequenceTracker:
                 return False
             self._seen[device_id] = seq
             return True
+
+
+class UplinkError(Exception):
+    """The cloud could not be reached securely or rejected the reading."""
+
+
+class LegacyUplink:
+    """The original cloud path: plain JSON with the static token in a header.
+
+    Kept unchanged so it remains an exact baseline and a rollback option.
+    """
+
+    name = "legacy"
+
+    def __init__(self, cloud_url: str) -> None:
+        # rstrip so that "http://host:8000/" and "http://host:8000" both build
+        # correct URLs below.
+        self.cloud_url = cloud_url.rstrip("/")
+
+    def send(self, reading: dict) -> None:
+        """POST one reading. Raises requests.RequestException on failure."""
+        response = requests.post(
+            f"{self.cloud_url}/api/v1/telemetry",
+            json=reading,
+            headers={"X-Gateway-Token": GATEWAY_TOKEN},
+            timeout=CLOUD_TIMEOUT_S,
+        )
+        # Covers 4xx and 5xx: a 401 from a wrong token must not be logged
+        # as a success.
+        response.raise_for_status()
+
+
+@dataclass
+class _PqcSession:
+    """The gateway's half of one ML-KEM session."""
+
+    session_id: str
+    aead_key: bytes
+    expires_at: float      # time.monotonic() deadline, renewed a bit early
+    max_messages: int
+    next_counter: int = 0
+
+
+class PqcUplink:
+    """The post-quantum cloud path: ML-KEM-768 handshake + AES-256-GCM.
+
+    One instance is shared by every device thread. The lock makes sure only
+    one thread performs a handshake at a time and that every message gets a
+    unique counter, which is what keeps GCM nonces from ever repeating.
+    """
+
+    name = "mlkem"
+
+    # Start a new handshake this long before the cloud would expire the
+    # session, so a reading is never sent under a key that dies in transit.
+    RENEW_MARGIN_S = 60
+
+    def __init__(self, cloud_url: str, stats: GatewayStats,
+                 pinned_fingerprint: str | None = None,
+                 http=requests, token: str = GATEWAY_TOKEN) -> None:
+        """
+        Args:
+            cloud_url: base URL of the cloud service.
+            stats: counters to record handshake outcomes in.
+            pinned_fingerprint: expected SHA-256 of the cloud's public key,
+                as hex. None means trust on first use.
+            http: anything with requests-style get() and post(). Tests pass
+                FastAPI's TestClient here to run the real cloud in-process.
+            token: the shared gateway token proved during the handshake.
+        """
+        self.cloud_url = cloud_url.rstrip("/")
+        self.stats = stats
+        self.pinned = pinned_fingerprint.lower() if pinned_fingerprint else None
+        self.http = http
+        self.token = token
+        self._lock = threading.Lock()
+        self._session: _PqcSession | None = None
+
+    def send(self, reading: dict) -> None:
+        """Seal one reading and POST it, re-handshaking once if needed.
+
+        Raises:
+            UplinkError: if no session can be established or the cloud
+                rejects the message.
+            requests.RequestException: if the cloud is unreachable.
+        """
+        plaintext = json.dumps(reading, separators=(",", ":")).encode()
+
+        # At most two attempts: the second only happens when the cloud says
+        # it no longer knows our session (it restarted, or the session hit
+        # its limits), and a fresh handshake fixes that. Any other failure
+        # would fail the same way again, so it is not retried.
+        for attempt in (1, 2):
+            session, counter = self._next_message()
+            nonce, sealed = channel.seal(session.aead_key, counter,
+                                         session.session_id, plaintext)
+            response = self.http.post(
+                f"{self.cloud_url}/api/v2/telemetry",
+                json={
+                    "session_id": session.session_id,
+                    "nonce": channel.b64encode(nonce),
+                    "ciphertext": channel.b64encode(sealed),
+                },
+                timeout=CLOUD_TIMEOUT_S,
+            )
+            if response.status_code == 401 and attempt == 1:
+                log.info("cloud dropped session %s..., re-handshaking",
+                         session.session_id[:8])
+                self._invalidate(session)
+                continue
+            if response.status_code >= 400:
+                raise UplinkError(f"cloud rejected sealed reading: "
+                                  f"HTTP {response.status_code}")
+            return
+
+    def _next_message(self) -> tuple[_PqcSession, int]:
+        """Return a usable session and a counter no other message will use."""
+        with self._lock:
+            session = self._session
+            if (session is None
+                    or time.monotonic() >= session.expires_at
+                    or session.next_counter >= session.max_messages):
+                session = self._session = self._handshake()
+            counter = session.next_counter
+            session.next_counter += 1
+            return session, counter
+
+    def _invalidate(self, session: _PqcSession) -> None:
+        """Forget a session the cloud has rejected.
+
+        Only if it is still the current one: another thread may already have
+        replaced it, and throwing away that fresh session would force a
+        needless second handshake.
+        """
+        with self._lock:
+            if self._session is session:
+                self._session = None
+
+    def _handshake(self) -> _PqcSession:
+        """Run the ML-KEM handshake described in pqc_channel/channel.py.
+
+        Caller must hold self._lock.
+        """
+        started = time.perf_counter()
+        try:
+            session = self._do_handshake()
+        except (channel.ChannelError, requests.RequestException,
+                KeyError, TypeError, ValueError) as exc:
+            # KeyError / TypeError / ValueError cover a cloud response that
+            # is not the JSON shape we expect, including non-JSON bodies.
+            self.stats.bump("handshakes_failed")
+            log.error("ML-KEM handshake failed: %s", exc)
+            raise UplinkError(f"handshake failed: {exc}") from exc
+
+        self.stats.bump("handshakes_ok")
+        log.info("ML-KEM session %s... established in %.1f ms",
+                 session.session_id[:8],
+                 (time.perf_counter() - started) * 1000)
+        return session
+
+    def _do_handshake(self) -> _PqcSession:
+        # 1. Fetch the cloud's public key and check it is the one we expect.
+        response = self.http.get(f"{self.cloud_url}/api/v2/pqc/public-key",
+                                 timeout=CLOUD_TIMEOUT_S)
+        if response.status_code != 200:
+            raise channel.ChannelError(
+                f"public key request returned HTTP {response.status_code}")
+        body = response.json()
+        if body["algorithm"] != channel.ALGORITHM:
+            raise channel.ChannelError(
+                f"cloud offers {body['algorithm']!r}, "
+                f"gateway requires {channel.ALGORITHM}")
+        cloud_pk = channel.b64decode(body["public_key"],
+                                     channel.PUBLIC_KEY_BYTES)
+
+        # Fingerprint computed locally from the key itself. The cloud also
+        # sends a "fingerprint" field, but trusting it would let an attacker
+        # pair their own key with the genuine fingerprint.
+        actual = channel.fingerprint(cloud_pk)
+        if self.pinned is None:
+            log.warning("no cloud key fingerprint configured; trusting %s on "
+                        "first use. Pass --cloud-key-fingerprint to pin it.",
+                        actual)
+            self.pinned = actual
+        elif not hmac.compare_digest(actual, self.pinned):
+            raise channel.ChannelError(
+                f"cloud public key fingerprint {actual} does not match the "
+                f"pinned {self.pinned}; refusing to connect (possible man in "
+                f"the middle, or the cloud key was rotated)")
+
+        # 2. Encapsulate to the cloud's long-term key, and make a one-time
+        #    key pair of our own for forward secrecy.
+        static_ss, static_ct = channel.encapsulate(cloud_pk)
+        ephemeral_pk, ephemeral_sk = channel.generate_keypair()
+
+        response = self.http.post(
+            f"{self.cloud_url}/api/v2/pqc/session",
+            json={
+                "static_ciphertext": channel.b64encode(static_ct),
+                "ephemeral_public_key": channel.b64encode(ephemeral_pk),
+                "gateway_proof": channel.b64encode(
+                    channel.gateway_proof(self.token, static_ct, ephemeral_pk)
+                ),
+            },
+            timeout=CLOUD_TIMEOUT_S,
+        )
+        if response.status_code != 201:
+            raise channel.ChannelError(
+                f"session request returned HTTP {response.status_code}")
+        body = response.json()
+
+        # 3. Recover the second secret and derive the session keys.
+        ephemeral_ct = channel.b64decode(body["ephemeral_ciphertext"],
+                                         channel.CIPHERTEXT_BYTES)
+        ephemeral_ss = channel.decapsulate(ephemeral_sk, ephemeral_ct)
+        # Drop our reference to the one-time private key. Python cannot
+        # guarantee the bytes are wiped from memory, which is a limitation of
+        # doing this in pure Python rather than a claim of secure erasure.
+        del ephemeral_sk
+
+        aead_key, confirm_key = channel.derive_session_keys(
+            static_ss, ephemeral_ss,
+            channel.transcript(cloud_pk, static_ct, ephemeral_pk,
+                               ephemeral_ct),
+        )
+
+        # 4. Only the holder of the pinned key's private half could have
+        #    produced this tag. This is the step that authenticates the cloud.
+        session_id = body["session_id"]
+        channel.verify_confirmation(
+            confirm_key, session_id,
+            channel.b64decode(body["confirmation"]),
+        )
+
+        lifetime = max(0, int(body["expires_in_s"]) - self.RENEW_MARGIN_S)
+        return _PqcSession(
+            session_id=session_id,
+            aead_key=aead_key,
+            expires_at=time.monotonic() + lifetime,
+            max_messages=int(body["max_messages"]),
+        )
 
 
 class DeviceHandler(socketserver.StreamRequestHandler):
@@ -207,24 +483,17 @@ class DeviceHandler(socketserver.StreamRequestHandler):
         self._forward(reading)
 
     def _forward(self, reading: dict) -> None:
-        """POST one reading to the cloud service.
+        """Send one reading to the cloud over the configured uplink.
 
         Sends synchronously on the device's own thread. That is acceptable at
         this scale and keeps the code readable, but it does mean a slow cloud
         slows down the device that triggered the request - worth noting as a
         scaling limit in the final evaluation.
         """
+        uplink = self.server.uplink
         try:
-            response = requests.post(
-                f"{self.server.cloud_url}/api/v1/telemetry",
-                json=reading,
-                headers={"X-Gateway-Token": GATEWAY_TOKEN},
-                timeout=CLOUD_TIMEOUT_S,
-            )
-            # Covers 4xx and 5xx: a 401 from a wrong token must not be logged
-            # as a success.
-            response.raise_for_status()
-        except requests.RequestException as exc:
+            uplink.send(reading)
+        except (requests.RequestException, UplinkError) as exc:
             # There is no queue, so the reading is now permanently lost. We
             # count it so the loss is at least visible, and store-and-forward
             # is on the backlog.
@@ -234,8 +503,9 @@ class DeviceHandler(socketserver.StreamRequestHandler):
             return
 
         self.server.stats.bump("forwarded_ok")
-        log.info("forwarded %s seq=%d temp=%.2f",
-                 reading["device_id"], reading["seq"], reading["temp_c"])
+        log.info("forwarded %s seq=%d temp=%.2f via %s",
+                 reading["device_id"], reading["seq"], reading["temp_c"],
+                 uplink.name)
 
 
 class GatewayServer(socketserver.ThreadingTCPServer):
@@ -250,15 +520,22 @@ class GatewayServer(socketserver.ThreadingTCPServer):
     # is idle between readings.
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], cloud_url: str) -> None:
+    def __init__(self, address: tuple[str, int], uplink=None,
+                 stats: GatewayStats | None = None) -> None:
+        """
+        Args:
+            address: (host, port) to listen on for devices.
+            uplink: a LegacyUplink or PqcUplink. Taken as a parameter so tests
+                and main() choose the cloud path without the server caring
+                which one it is.
+            stats: counters, shared with the uplink so handshake outcomes
+                land in the same snapshot as the frame counters.
+        """
         super().__init__(address, DeviceHandler)
-
-        # rstrip so that "http://host:8000/" and "http://host:8000" both build
-        # correct URLs below.
-        self.cloud_url = cloud_url.rstrip("/")
+        self.uplink = uplink
 
         # Shared by every handler thread; both are internally locked.
-        self.stats = GatewayStats()
+        self.stats = stats if stats is not None else GatewayStats()
         self.sequences = SequenceTracker()
 
 
@@ -270,6 +547,15 @@ def main() -> None:
                         help="TCP port devices connect to")
     parser.add_argument("--cloud-url", default="http://127.0.0.1:8000",
                         help="base URL of the cloud service")
+    parser.add_argument("--crypto", choices=["mlkem", "legacy"],
+                        default="mlkem",
+                        help="cloud path: ML-KEM (default) or the legacy "
+                             "rollback path")
+    parser.add_argument("--cloud-key-fingerprint",
+                        default=os.environ.get("CLOUD_KEY_FINGERPRINT"),
+                        help="expected SHA-256 of the cloud's ML-KEM public "
+                             "key (shown in the cloud's /health); without it "
+                             "the first key seen is trusted")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -277,9 +563,18 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
-    server = GatewayServer((args.host, args.port), args.cloud_url)
-    log.info("gateway listening on %s:%d, cloud at %s",
-             args.host, args.port, server.cloud_url)
+    stats = GatewayStats()
+    if args.crypto == "mlkem":
+        uplink = PqcUplink(args.cloud_url, stats,
+                           pinned_fingerprint=args.cloud_key_fingerprint)
+    else:
+        log.warning("running on the LEGACY cloud path: readings and the "
+                    "gateway token cross the network unprotected")
+        uplink = LegacyUplink(args.cloud_url)
+
+    server = GatewayServer((args.host, args.port), uplink, stats)
+    log.info("gateway listening on %s:%d, cloud at %s via %s",
+             args.host, args.port, uplink.cloud_url, uplink.name)
 
     try:
         server.serve_forever()
