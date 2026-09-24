@@ -61,6 +61,52 @@ curl "http://127.0.0.1:8000/api/v1/telemetry?limit=5"
 
 Interactive API docs are served at <http://127.0.0.1:8000/docs>.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest              # all 58 tests
+python -m pytest -m security  # only the tests that demonstrate weaknesses
+```
+
+Tests marked `security` deliberately assert that a weakness is real and
+exploitable, rather than guarding against it. They are the evidence behind the
+security findings in the report - for example
+`test_finding_tampering_with_the_iv_rewrites_data_undetected` forges a reading
+from a different device without knowing the key, which the gateway accepts as
+valid.
+
+## Baseline measurements
+
+Taken **before** ML-KEM integration, so the report can show the real cost of
+the migration rather than an unanchored number. 
+
+```bash
+python -m tools.baseline          # local measurements only
+python -m tools.baseline --e2e    # also latency and throughput (services must be running) 
+```
+
+Results are written to `docs/measurements/baseline-<date>.json`. Re-run the
+same script after ML-KEM integration with `--label mlkem` so both files
+survive and can be compared.
+
+Measured on 17 September 2026:
+
+| Measurement | Legacy baseline |
+| --- | --- |
+| Frame on the wire | 98 B (28 B plaintext + 70 B overhead) |
+| Device buffer used | 38.3% of 256 B |
+| Key-establishment handshake | **0 B, 0 round trips** - the key is hardcoded |
+| Key rotation supported | No |
+| Encrypt per frame | 0.0058 ms median (~172,000 ops/s) |
+| Decrypt per frame | 0.0059 ms median (~169,000 ops/s) |
+| End-to-end latency, device to cloud | 9.7 ms median, 33.5 ms p95 |
+| Sustained ingest | 105.5 readings/s |
+| ML-KEM-768 handshake, projected | 2272 B, 1 round trip - **does not fit the device buffer** |
+
+The zero-byte handshake is the headline figure: the legacy system is fast
+precisely because it performs no key establishment at all.
+
 ## Wire protocol (legacy)
 
 Each frame is one newline-terminated ASCII line:
@@ -92,14 +138,14 @@ These are deliberate. They are the work items for the modernization phase.
 4. **No transport security gateway -> cloud.** Plain HTTP.
 5. **No store-and-forward.** Readings are dropped if the cloud is unreachable.
 6. **In-memory storage only.** The cloud loses all data on restart.
-7. **No automated tests, CI, containers, or metrics endpoints yet.**
+7. **No CI, containers, or metrics endpoints yet.** Tests now exist; see below.
 8. **Shared protocol module.** `edge_gateway` imports from
    `legacy_device.protocol`, which couples two separately deployable services.
 
 ## Project status
 
 - [x] Baseline: device, gateway, cloud running end to end
-- [ ] Automated tests and baseline measurements
+- [x] Automated tests (58) and baseline measurements captured
 - [ ] Containers and CI/CD pipeline
 - [ ] Crypto-agility layer and suite negotiation
 - [ ] ML-KEM / hybrid integration on the gateway-cloud path

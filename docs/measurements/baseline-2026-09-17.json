@@ -1,0 +1,67 @@
+{
+  "label": "baseline",
+  "measured_at": "2026-09-17T12:12:35.416057+00:00",
+  "python": "3.11.5",
+  "platform": "win32",
+  "frame_sizes": {
+    "reference_record": "DEV|dev-001|1|21.50|44.20|12",
+    "plaintext_bytes": 28,
+    "frame_bytes": 98,
+    "overhead_bytes": 70,
+    "device_buffer_bytes": 256,
+    "buffer_used_percent": 38.3,
+    "headroom_bytes": 158
+  },
+  "key_establishment": {
+    "legacy": {
+      "mechanism": "hardcoded pre-shared AES-128 key",
+      "handshake_round_trips": 0,
+      "handshake_bytes": 0,
+      "handshake_ms": 0.0,
+      "key_rotation_supported": false,
+      "forward_secrecy": false
+    },
+    "mlkem768_projected": {
+      "mechanism": "ML-KEM-768 encapsulation (NIST FIPS 203)",
+      "handshake_round_trips": 1,
+      "handshake_bytes": 2272,
+      "shared_secret_bytes": 32,
+      "key_rotation_supported": true,
+      "forward_secrecy": true,
+      "fits_device_buffer": false
+    }
+  },
+  "crypto_throughput": {
+    "encrypt_frame": {
+      "iterations": 5000,
+      "mean_ms": 0.00583,
+      "median_ms": 0.0058,
+      "p95_ms": 0.0062,
+      "ops_per_second": 172414
+    },
+    "decrypt_frame": {
+      "iterations": 5000,
+      "mean_ms": 0.00593,
+      "median_ms": 0.0059,
+      "p95_ms": 0.0061,
+      "ops_per_second": 169491
+    }
+  },
+  "end_to_end": {
+    "samples": 20,
+    "poll_interval_ms": 5.0,
+    "note": "includes polling overhead; treat as an upper bound",
+    "mean_ms": 14.74,
+    "median_ms": 9.7,
+    "p95_ms": 33.46,
+    "min_ms": 7.81,
+    "max_ms": 33.46
+  },
+  "throughput": {
+    "frames_sent": 200,
+    "readings_stored": 200,
+    "elapsed_s": 1.897,
+    "readings_per_second": 105.5,
+    "note": "single device connection; the ring buffer caps total storage at 1000 readings"
+  }
+}
