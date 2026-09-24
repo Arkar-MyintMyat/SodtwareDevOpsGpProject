@@ -1,0 +1,58 @@
+# Continuous integration: runs the full test suite on every push and pull
+# request, so a change that breaks the system is caught before it is merged.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Lets anyone in the group re-run CI by hand from the Actions tab.
+  workflow_dispatch:
+
+# The pipeline only reads the repository; it never needs to write to it.
+permissions:
+  contents: read
+
+# A newer push to the same branch cancels the older run instead of queueing.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The suite takes seconds; a hung socket test should not burn an hour.
+    timeout-minutes: 10
+
+    strategy:
+      # Report every Python version's result even if one fails.
+      fail-fast: false
+      matrix:
+        # 3.11 is the version the README requires and the team develops on.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+            */requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest
+
+      # The security-marked tests are also part of the run above. Listing them
+      # separately makes the evidence for the report easy to find in the log.
+      - name: Security findings (weaknesses the baseline demonstrates)
+        run: python -m pytest -m security -v
